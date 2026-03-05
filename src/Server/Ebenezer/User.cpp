@@ -11896,6 +11896,10 @@ bool CUser::CheckEventLogic(const EVENT_DATA* pEventData)
 					bExact = true;
 				break;
 
+			case LOGIC_CHECK_EXCHANGE:
+				bExact = CheckExchange(pLE->m_LogicElseInt[0]);
+				break;
+
 			case LOGIC_CHECK_NOEXIST_ITEM:
 				if (!CheckExistItem(pLE->m_LogicElseInt[0], pLE->m_LogicElseInt[1]))
 					bExact = true;
@@ -12155,6 +12159,10 @@ bool CUser::RunEvent(const EVENT_DATA* pEventData)
 				GivePromotionQuest();
 				break;
 
+			case EXEC_RUN_EXCHANGE:
+				RunExchange(pExec->m_ExecInt[0]);
+				break;
+
 			case EXEC_ZONE_CHANGE:
 				ZoneChange(pExec->m_ExecInt[0], static_cast<float>(pExec->m_ExecInt[1]),
 					static_cast<float>(pExec->m_ExecInt[2]));
@@ -12375,6 +12383,10 @@ bool CUser::CheckWeight(int itemid, int16_t count) const
 
 bool CUser::CheckExistItem(int itemId, int16_t count) const
 {
+	// Return true for an unset item; needed for ITEM_EXCHANGE to function properly
+	if (itemId <= 0 && count <= 0)
+		return true;
+
 	// This checks if such an item exists.
 	model::Item* pTable = m_pMain->m_ItemTableMap.GetData(itemId);
 	if (pTable == nullptr)
@@ -12486,6 +12498,189 @@ bool CUser::CheckNoExistItemAnd(const std::span<const ItemPair> items) const
 	return true;
 }
 
+bool CUser::CheckExchange(int exchangeId) const
+{
+	auto exchange = m_pMain->m_ItemExchangeMap.GetData(exchangeId);
+	if (exchange == nullptr)
+		return false;
+
+	int16_t openSlotCount = 0;
+	for (int i = SLOT_MAX; i < INVENTORY_TOTAL; i++)
+	{
+		if (m_pUserData->m_sItemArray[i].nNum <= 0)
+			openSlotCount++;
+	}
+
+	// Officially this check sums the ExchangeItemCount columns
+	// and triggers this logic if the sum is over 9000. We just check
+	// the RandomFlag instead.
+	// RandomFlag != 0 exchanges are expected to grant one random item.
+	// This likely leads to an official bug where a stackable item
+	// that already existed in a user's inventory could have fit an item.
+	// However, that would allow users to fish for stackable items only
+	// in their inventory.
+	if (exchange->RandomFlag != EXCHANGE_TYPE_ALL_ITEMS)
+		return openSlotCount > 0;
+
+	// RandomFlag == 0 exchanges are expected to grant all exchange items listed,
+	// so the inventory check is more robust
+	int slotsRequired = 0;
+	for (const int32_t iNum : exchange->ExchangeItemNumber)
+	{
+		const auto* item = m_pMain->m_ItemTableMap.GetData(iNum);
+		if (item == nullptr)
+			continue;
+
+		bool needsSlot = true;
+		if (item->Countable)
+		{
+			for (int i = SLOT_MAX; i < INVENTORY_TOTAL; i++)
+			{
+				if (m_pUserData->m_sItemArray[i].nNum == iNum)
+				{
+					needsSlot = false;
+					break;
+				}
+			}
+		}
+
+		if (needsSlot)
+			slotsRequired++;
+	}
+
+	return openSlotCount >= slotsRequired;
+}
+
+void CUser::RunExchange(int exchangeId)
+{
+	auto exchange = m_pMain->m_ItemExchangeMap.GetData(exchangeId);
+	if (exchange == nullptr)
+		return;
+
+	// make sure the exchange is valid and that we have enough inventory space
+	if (!CheckExchange(exchangeId))
+		return;
+
+	// load into ItemPair arrays for processing
+	ItemPair originItems[MAX_EXCHANGE_ITEMS] {};
+	ItemPair exchangeItems[MAX_EXCHANGE_ITEMS] {};
+	for (int i = 0; i < MAX_EXCHANGE_ITEMS; i++)
+	{
+		originItems[i].ItemId   = exchange->OriginItemNumber[i];
+		originItems[i].Count    = exchange->OriginItemCount[i];
+		exchangeItems[i].ItemId = exchange->ExchangeItemNumber[i];
+		exchangeItems[i].Count  = exchange->ExchangeItemCount[i];
+	}
+
+	// Take any required input items
+	if (!CheckAndRobItems(originItems))
+	{
+		spdlog::debug("User::RunExchange: User does not have all items [charId={} exchangeId={}]",
+			m_pUserData->m_id, exchangeId);
+		return;
+	}
+
+	// Reward processing varies by the exchange's RandomFlag
+	if (exchange->RandomFlag == EXCHANGE_TYPE_ALL_ITEMS)
+	{
+		if (!GiveItemAnd(exchangeItems))
+		{
+			spdlog::debug("User::RunExchange: Failed to grant all items [charId={} exchangeId={}]",
+				m_pUserData->m_id, exchangeId);
+		}
+
+		return;
+	}
+
+	if (exchange->RandomFlag == EXCHANGE_TYPE_ONE_OF_WEIGHTED)
+	{
+		static constexpr int16_t ONE_HUNDRED_PERCENT = 10000;
+
+		int sum                                      = 0;
+		for (const int count : exchange->ExchangeItemCount)
+			sum += count;
+
+		// acts as a bounds check on exchangeTable before populating it
+		if (sum > ONE_HUNDRED_PERCENT)
+		{
+			spdlog::error("User::RunExchange: Exchange configured for over 100% drop rate "
+						  "[charId={} exchangeId={} sum={}]",
+				m_pUserData->m_id, exchangeId, sum);
+			return;
+		}
+		if (sum < ONE_HUNDRED_PERCENT)
+		{
+			spdlog::warn("User::RunExchange: Exchange configured for under 100% drop rate "
+						 "[charId={} exchangeId={} sum={}]",
+				m_pUserData->m_id, exchangeId, sum);
+		}
+
+		// This is how the official server handles the exchange, with a large array.
+		// This is pretty wasteful so we'll just do a sliding window style range check instead.
+		// int ptr1 = 0;
+		// uint8_t exchangeTable[ONE_HUNDRED_PERCENT] {};
+		// for (uint8_t i = 0; i < MAX_EXCHANGE_ITEMS; i++)
+		// {
+		// 	memset(exchangeTable + ptr1, i, exchangeItems[i].Count);
+		// 	ptr1 += exchangeItems[i].Count;
+		// }
+		// // This is official logic - but it has a problem.  If an exchange does not add up to
+		// // ONE_HUNDRED_PERCENT, the "unfilled percent" slots will default to exchange item 0
+		// int16_t slotRolled = exchangeTable[myrand(0, 9999)];
+
+		const int16_t roll = myrand(0, ONE_HUNDRED_PERCENT - 1);
+		int prev           = 0;
+		int16_t slotRolled = 0;
+		for (uint8_t i = 0; i < MAX_EXCHANGE_ITEMS; i++)
+		{
+			if (roll >= prev && roll < exchangeItems[i].Count + prev)
+			{
+				slotRolled = i;
+				break;
+			}
+			prev += exchangeItems[i].Count;
+		}
+
+		if (!GiveItem(exchangeItems[slotRolled].ItemId, 1, true))
+		{
+			spdlog::debug(
+				"User::RunExchange: Failed to grant item [charId={} exchangeId={} itemId={}]",
+				m_pUserData->m_id, exchangeId, exchangeItems[slotRolled].ItemId);
+		}
+		m_byLastExchangeNum = slotRolled + 1;
+
+		// Officially, this call is made here. We've descoped OLYMPIC
+		// events/logic as they are not used by any of the official evt files
+		// Proconsul exchange for bronze/silver/gold coin
+		// if (exchangeId == EXCHANGE_ID_OLYMPIC_ITEM)
+		// 	GiveOlympicItem(exchangeItems[slotRolled].ItemId, 1);
+	}
+	else
+	{
+		// EXCHANGE_TYPE_ONE_OF_EQUAL impl
+		// RandomFlag can be between 1 and 100, although as far as we can tell
+		// it is only ever officially called as 5 (equal chance split).
+		// 1-4 can be used if less than 5 items are configured for the exchange.
+		//
+		// 6-100 would be out of bounds, but officially all of these indicies would
+		// fall back to 4.  This does not appear to be intended use.
+		//
+		// officially:
+		// int16_t selectedSlot = myrand(0, 1000 * exchange->RandomFlag) / 1000;
+		// this is really just myrand(0, randomFlag-1) with more ops and the chance to
+		// go out of range if a max roll happens.
+		//
+		// For example, if a randomFlag = 5 and myrand rolled 5000, the int division
+		// would set selectedSlot to 5 and exceed the bounds of the exchange table.
+		//
+		// We clamp the RandomFlag for bounds safety in our implementation.
+		const uint8_t clampFlag = std::clamp<uint8_t>(
+			exchange->RandomFlag, 0, MAX_EXCHANGE_ITEMS - 1);
+		const int16_t selectedSlot = myrand(0, clampFlag);
+		GiveItem(exchangeItems[selectedSlot].ItemId, exchangeItems[selectedSlot].Count);
+	}
+}
+
 bool CUser::RobItem(int itemId, int16_t count)
 {
 	int sendIndex = 0;
@@ -12538,6 +12733,9 @@ bool CUser::RobItem(int itemId, int16_t count)
 	SetByte(sendBuffer, i - SLOT_MAX, sendIndex);
 	SetDWORD(sendBuffer, itemId, sendIndex); // The ID of item.
 	SetDWORD(sendBuffer, m_pUserData->m_sItemArray[i].sCount, sendIndex);
+	SetByte(sendBuffer, ITEM_COUNT_CHANGE_EXISTING, sendIndex);
+	SetShort(sendBuffer, m_pUserData->m_sItemArray[i].sDuration, sendIndex);
+
 	Send(sendBuffer, sendIndex);
 	return true;
 }
@@ -12591,17 +12789,17 @@ bool CUser::CheckAndRobItems(const std::span<const ItemPair> items, const int go
 	return true;
 }
 
-bool CUser::GiveItem(int itemid, int16_t count)
+bool CUser::GiveItem(int itemId, int16_t count, bool isExchange101)
 {
 	int pos = 255, sendIndex = 0;
 	char sendBuffer[128] {};
 
 	// This checks if such an item exists.
-	model::Item* pTable = m_pMain->m_ItemTableMap.GetData(itemid);
+	model::Item* pTable = m_pMain->m_ItemTableMap.GetData(itemId);
 	if (pTable == nullptr)
 		return false;
 
-	pos = GetEmptySlot(itemid, pTable->Countable);
+	pos = GetEmptySlot(itemId, pTable->Countable);
 
 	// No empty slots.
 	if (pos == 0xFF)
@@ -12616,7 +12814,7 @@ bool CUser::GiveItem(int itemid, int16_t count)
 		if (pTable->Countable != 1)
 			return false;
 
-		if (m_pUserData->m_sItemArray[SLOT_MAX + pos].nNum != itemid)
+		if (m_pUserData->m_sItemArray[SLOT_MAX + pos].nNum != itemId)
 			return false;
 	}
 
@@ -12635,7 +12833,7 @@ bool CUser::GiveItem(int itemid, int16_t count)
 	}*/
 
 	// Add item to inventory.
-	m_pUserData->m_sItemArray[SLOT_MAX + pos].nNum = itemid;
+	m_pUserData->m_sItemArray[SLOT_MAX + pos].nNum = itemId;
 
 	// Apply number of items to a countable item.
 	if (pTable->Countable != 0)
@@ -12653,14 +12851,39 @@ bool CUser::GiveItem(int itemid, int16_t count)
 	// Apply duration to item.
 	m_pUserData->m_sItemArray[SLOT_MAX + pos].sDuration = pTable->Durability;
 
+	// Log item grant
+	e_ItemLogType type                                  = ITEM_LOG_GIVE_ITEM;
+	if (isExchange101)
+		type = ITEM_LOG_GIVE_ITEM_EXCHANGE_101;
+
+	ItemLogToAgent(m_pUserData->m_id, m_pUserData->m_id, type,
+		m_pUserData->m_sItemArray[SLOT_MAX + pos].nSerialNum, itemId, count, pTable->Durability);
+
 	SendItemWeight();                        // Change weight first :)
 	SetByte(sendBuffer, WIZ_ITEM_COUNT_CHANGE, sendIndex);
 	SetShort(sendBuffer, 1, sendIndex);      // The number of for-loops
-	SetByte(sendBuffer, 1, sendIndex);
+	SetByte(sendBuffer, 1, sendIndex);       // "district"
 	SetByte(sendBuffer, pos, sendIndex);
-	SetDWORD(sendBuffer, itemid, sendIndex); // The ID of item.
+	SetDWORD(sendBuffer, itemId, sendIndex); // The ID of item.
 	SetDWORD(sendBuffer, m_pUserData->m_sItemArray[SLOT_MAX + pos].sCount, sendIndex);
+	SetByte(sendBuffer, ITEM_COUNT_CHANGE_NEW, sendIndex);
+	SetShort(sendBuffer, m_pUserData->m_sItemArray[SLOT_MAX + pos].sDuration, sendIndex);
 	Send(sendBuffer, sendIndex);
+	return true;
+}
+
+bool CUser::GiveItemAnd(const std::span<const ItemPair> items, bool isExchange101)
+{
+	for (const ItemPair& item : items)
+	{
+		if (item.ItemId != -1 && !GiveItem(item.ItemId, item.Count, isExchange101))
+		{
+			spdlog::debug("User::GiveItemAnd: Failed to give item [charId={} itemId={} count={}]",
+				m_pUserData->m_id, item.ItemId, item.Count);
+			return false;
+		}
+	}
+
 	return true;
 }
 
@@ -13573,7 +13796,7 @@ void CUser::ItemUpgrade(char* pBuf)
 	}
 	else
 	{
-		ItemLogToAgent(m_pUserData->m_id, "UPGRADE", ITEM_LOG_UPGRADE_FAILED, originItem.nSerialNum,
+		ItemLogToAgent(m_pUserData->m_id, "UPGRADE", ITEM_LOG_UNSPECIFIED, originItem.nSerialNum,
 			originItemId, 1, 0);
 
 		originItem.nNum           = 0;
